@@ -1,0 +1,16 @@
+# Segreti
+.env
+
+# Dipendenze
+node_modules/
+
+# Dati generati a runtime dal bot (persistenti sul server, non su git)
+config.settings.json
+member_numbers.json
+stats_channels.json
+ticket_data.json
+backups/
+
+# Log / OS
+npm-debug.log*
+.DS_Store

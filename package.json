@@ -1,0 +1,17 @@
+{
+  "name": "discord-antinuke-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord con anti-nuke, anti-spam, anti-ping, anti-raid, server stats, ticket e configurazione runtime via slash command /config.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.6.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
