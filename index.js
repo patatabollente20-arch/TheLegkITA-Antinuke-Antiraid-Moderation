@@ -16,8 +16,12 @@ const {
     AuditLogEvent,
     ActionRowBuilder,
     ButtonBuilder,
-    ButtonStyle
+    ButtonStyle,
+    AttachmentBuilder
 } = require('discord.js');
+
+// ================= COMANDO /creavideo (importato dal bot video) =================
+const creavideoCommand = require('./commands/creavideo.js');
 
 // ================= VIOLATION TRACKER UNIFICATO =================
 
@@ -230,7 +234,8 @@ class PingTracker {
         this.rotationalCache = new Map();
         this.globalCache = new Map();
         this.everyoneCache = new Map();
-        // Tracker separato: non modifica la regola @everyone già esistente.
+        // Tracker separato: conta gli INCIDENTI di abuso @everyone multi-canale
+        // (non i singoli messaggi) per rilevare pattern ripetuti nel tempo.
         this.everyoneAbuseCache = new Map();
     }
 
@@ -307,7 +312,10 @@ class PingTracker {
         return { totalPings: entry.timestamps.length, uniqueChannels: entry.channels.size };
     }
 
-    // Nuova regola: >2 @everyone in messaggi separati e in canali diversi entro 1 ora.
+    // Conta gli INCIDENTI di abuso @everyone multi-canale (non i singoli
+    // messaggi): va chiamato UNA volta per ogni volta che scatta la regola
+    // "@everyone su 2+ canali diversi", per rilevare se lo stesso utente
+    // ripete il pattern più volte entro la finestra di tempo configurata.
     addEveryoneAbusePing(userId, channelId, timestamp = Date.now()) {
         const now = Date.now();
         const windowMs = this.config.everyoneAbuseWindow;
@@ -332,6 +340,16 @@ class PingTracker {
         this.rotationalCache.delete(userId);
         this.globalCache.delete(userId);
         this.everyoneCache.delete(userId);
+        // NOTA IMPORTANTE: everyoneAbuseCache è ESCLUSO volutamente da
+        // clearUser. Deve sopravvivere alle singole punizioni "normali",
+        // altrimenti la soglia di N incidenti/1h non verrebbe MAI raggiunta
+        // (ogni punizione normale la cancellerebbe prima che possa
+        // accumularsi — era questo il bug della versione precedente).
+    }
+
+    // Da chiamare esplicitamente solo quando si vuole azzerare anche lo
+    // storico degli abusi ripetuti (dopo aver applicato la sanzione massima).
+    clearEveryoneAbuse(userId) {
         this.everyoneAbuseCache.delete(userId);
     }
 
@@ -393,30 +411,164 @@ class PingTracker {
     }
 }
 
-// ================= RAID TRACKER =================
-
+// ================= RAID TRACKER (MULTI-LIVELLO) =================
+// Il vecchio sistema rilevava SOLO un burst di join molto rapido e stretto
+// (es. 6+ in 10s). Un raid "furbo" può però bypassarlo in vari modi:
+//  - entrando un po' più lentamente ma comunque in massa (es. 15 account in
+//    60s, sotto la soglia del burst rapido)
+//  - usando molti account creati pochi minuti/ore prima (segnale fortissimo
+//    di raid, indipendentemente dalla velocità di ingresso)
+//  - entrando "silenziosamente" e poi attaccando tutti insieme via messaggi
+//    (spam/ping/link) invece che tramite il pattern di join
+// Questo tracker copre i primi due casi; il terzo (attacco comportamentale)
+// è gestito da CoordinatedAttackTracker più sotto.
 class RaidTracker {
     constructor(config) {
         this.config = config;
-        this.joinTimes = [];
-        this.raidModeActive = false;
+        this.joinTimes = [];            // burst rapido (finestra breve)
+        this.slowJoinTimes = [];        // flusso sostenuto (finestra più larga)
+        this.newAccountJoinTimes = [];  // ingressi di account "giovani" (età < soglia)
+        this.recentJoiners = new Map(); // userId -> { joinedAt, accountAgeMs }: membri "a rischio raid"
+        this.recentJoinerSpam = new Map(); // userId -> [timestamp,...]: spam-check dedicato e SEPARATO
+        this.waveTimes = [];            // quando sono scattati i lockdown, per riconoscere ondate ripetute
     }
 
-    registerJoin(timestamp = Date.now()) {
+    // Registra un nuovo ingresso e ritorna i conteggi correnti per ciascun
+    // segnale di rilevamento raid.
+    registerJoin(member, timestamp = Date.now()) {
+        const accountAge = timestamp - member.user.createdTimestamp;
+
         this.joinTimes.push(timestamp);
-        this.joinTimes = this.joinTimes.filter(t =>
-            Date.now() - t < this.config.raidJoinTime
-        );
+        this.joinTimes = this.joinTimes.filter(t => timestamp - t < this.config.raidJoinTime);
 
-        return this.joinTimes.length;
+        this.slowJoinTimes.push(timestamp);
+        this.slowJoinTimes = this.slowJoinTimes.filter(t => timestamp - t < this.config.raidSlowJoinTime);
+
+        if (accountAge < this.config.raidNewAccountAgeMs) {
+            this.newAccountJoinTimes.push(timestamp);
+            this.newAccountJoinTimes = this.newAccountJoinTimes.filter(t => timestamp - t < this.config.raidNewAccountJoinTime);
+        }
+
+        // Registra il membro come "a rischio raid" per la finestra configurata:
+        // su di lui si applicherà una moderazione molto più severa se dovesse
+        // violare le regole (vedi handleRecentJoinerViolation).
+        this.recentJoiners.set(member.id, { joinedAt: timestamp, accountAgeMs: accountAge });
+
+        return {
+            fastCount: this.joinTimes.length,
+            slowCount: this.slowJoinTimes.length,
+            newAccountCount: this.newAccountJoinTimes.length
+        };
     }
 
-    checkRaidThreshold() {
-        return this.joinTimes.length > this.config.raidJoinLimit;
+    // Valuta TUTTI i segnali insieme (OR logico): basta che UNO superi la
+    // soglia per considerare l'evento un raid. Ritorna un array di motivi
+    // (vuoto = nessuna soglia superata), utile per un log dettagliato.
+    checkRaidThreshold(counts) {
+        const reasons = [];
+        if (counts.fastCount > this.config.raidJoinLimit) {
+            reasons.push(`Burst rapido: ${counts.fastCount} account entrati in ${this.config.raidJoinTime / 1000}s`);
+        }
+        if (counts.slowCount > this.config.raidSlowJoinLimit) {
+            reasons.push(`Flusso sostenuto: ${counts.slowCount} account entrati in ${Math.round(this.config.raidSlowJoinTime / 1000)}s`);
+        }
+        if (counts.newAccountCount >= this.config.raidNewAccountJoinLimit) {
+            const days = Math.round(this.config.raidNewAccountAgeMs / (24 * 60 * 60 * 1000));
+            reasons.push(`Ondata di account nuovi: ${counts.newAccountCount} account creati da meno di ${days}gg entrati in ${this.config.raidNewAccountJoinTime / 1000}s`);
+        }
+        return reasons;
+    }
+
+    // Un membro è "a rischio raid" se è entrato da meno di
+    // raidRecentJoinerWindowMs. Auto-pulisce l'entry se scaduta.
+    isRecentJoiner(userId, now = Date.now()) {
+        const info = this.recentJoiners.get(userId);
+        if (!info) return false;
+        if (now - info.joinedAt > this.config.raidRecentJoinerWindowMs) {
+            this.recentJoiners.delete(userId);
+            return false;
+        }
+        return true;
+    }
+
+    // Conteggio spam DEDICATO ai membri "a rischio raid": finestra breve e
+    // soglia bassa, tracker separato da SpamTracker per evitare di contare
+    // due volte lo stesso messaggio (una nel controllo anticipato, una nel
+    // normale flusso anti-spam).
+    registerRecentJoinerMessage(userId, timestamp = Date.now()) {
+        if (!this.recentJoinerSpam.has(userId)) this.recentJoinerSpam.set(userId, []);
+        let arr = this.recentJoinerSpam.get(userId).filter(t => timestamp - t < this.config.raidRecentJoinerSpamWindowMs);
+        arr.push(timestamp);
+        this.recentJoinerSpam.set(userId, arr);
+        return arr.length;
+    }
+
+    // Conta quante volte è scattato un lockdown nella finestra configurata:
+    // permette di riconoscere "ondate" ripetute e reagire in modo più duro
+    // (vedi activateLockdown).
+    registerWave(timestamp = Date.now()) {
+        this.waveTimes.push(timestamp);
+        this.waveTimes = this.waveTimes.filter(t => timestamp - t < this.config.raidWaveWindowMs);
+        return this.waveTimes.length;
+    }
+
+    // Azzera SOLO i contatori di join (usato dopo che un raid è stato
+    // rilevato/gestito). recentJoiners, recentJoinerSpam e waveTimes NON
+    // vengono toccati qui: devono sopravvivere sia alla gestione del singolo
+    // evento sia allo sblocco del lockdown, altrimenti perderemmo la
+    // capacità di riconoscere membri "a rischio" e ondate ripetute.
+    reset() {
+        this.joinTimes = [];
+        this.slowJoinTimes = [];
+        this.newAccountJoinTimes = [];
+    }
+
+    cleanup() {
+        const now = Date.now();
+        this.joinTimes = this.joinTimes.filter(t => now - t < this.config.raidJoinTime);
+        this.slowJoinTimes = this.slowJoinTimes.filter(t => now - t < this.config.raidSlowJoinTime);
+        this.newAccountJoinTimes = this.newAccountJoinTimes.filter(t => now - t < this.config.raidNewAccountJoinTime);
+
+        for (const [uid, info] of this.recentJoiners) {
+            if (now - info.joinedAt > this.config.raidRecentJoinerWindowMs) this.recentJoiners.delete(uid);
+        }
+
+        for (const [uid, arr] of this.recentJoinerSpam) {
+            const filtered = arr.filter(t => now - t < this.config.raidRecentJoinerSpamWindowMs);
+            if (filtered.length === 0) this.recentJoinerSpam.delete(uid);
+            else this.recentJoinerSpam.set(uid, filtered);
+        }
+
+        this.waveTimes = this.waveTimes.filter(t => now - t < this.config.raidWaveWindowMs);
+    }
+}
+
+// ================= COORDINATED ATTACK TRACKER =================
+// Rileva i raid "comportamentali": account entrati da poco che iniziano a
+// violare le regole (spam/ping/link) quasi in contemporanea, ANCHE SE il
+// pattern di join non aveva superato nessuna soglia numerica del
+// RaidTracker (es. sono entrati uno alla volta, distanziati, per non farsi
+// beccare, e poi attaccano tutti insieme). Conta quanti UTENTI DISTINTI
+// "a rischio raid" violano le regole in una finestra breve.
+class CoordinatedAttackTracker {
+    constructor(config) {
+        this.config = config;
+        this.events = []; // { userId, time }
+    }
+
+    register(userId, timestamp = Date.now()) {
+        this.events.push({ userId, time: timestamp });
+        this.events = this.events.filter(e => timestamp - e.time < this.config.raidCoordinatedWindowMs);
+        return new Set(this.events.map(e => e.userId)).size;
     }
 
     reset() {
-        this.joinTimes = [];
+        this.events = [];
+    }
+
+    cleanup() {
+        const now = Date.now();
+        this.events = this.events.filter(e => now - e.time < this.config.raidCoordinatedWindowMs);
     }
 }
 
@@ -623,43 +775,62 @@ class AntiViolationHandler {
         const isVoice = message.channel.isVoiceBased?.();
         const guild = message.guild;
 
-        // ── @EVERYONE: >2 MESSAGGI SEPARATI / CANALI DIVERSI / 1 ORA ─────
-        if (targets.has('everyone')) {
-            const abuseResult = this.pingTracker.addEveryoneAbusePing(uid, chId);
-            if (abuseResult.totalMessages >= this.CONFIG.everyoneAbuseLimit &&
-                abuseResult.uniqueChannels >= this.CONFIG.everyoneAbuseLimit) {
-                this.pingTracker.clearUser(uid);
-                const timeoutMs = this.CONFIG.everyoneAbuseTimeoutMs;
-                const reason = `Abuso @everyone: ${abuseResult.totalMessages} messaggi in ${abuseResult.uniqueChannels} canali diversi entro 1 ora`;
-                const [, timeoutResult] = await Promise.all([
-                    message.deletable ? message.delete().catch(() => {}) : Promise.resolve(),
-                    message.member.timeout(timeoutMs, reason)
-                        .then(() => ({ success: true }))
-                        .catch(err => {
-                            console.error(`[AntiPing Everyone 1h] Timeout ${uid}:`, err.message);
-                            return { success: false };
-                        })
-                ]);
-                if (timeoutResult.success) {
-                    broadcastLog(guild,
-                        `🚨 @Everyone Abuso Multi-Canale`,
-                        `**${message.author.tag}** → Timeout **3 ore**\n` +
-                        `Messaggi @everyone: ${abuseResult.totalMessages} | Canali diversi: ${abuseResult.uniqueChannels}\n` +
-                        `Finestra: 1 ora`,
-                        '#c0392b', uid
-                    ).catch(() => {});
-                }
-                return true;
-            }
-        }
-
-        // ── @EVERYONE MULTI-CANALE ──────────────────────────────────────
+        // ── @EVERYONE MULTI-CANALE (+ ESCALATION ABUSI RIPETUTI) ─────────
+        // Regola unificata: quando lo stesso utente manda @everyone in 2+
+        // canali diversi (finestra breve, vedi addEveryonePing), scatta
+        // subito una sanzione con la normale escalation (2min/10min/1h).
+        // Ogni volta che questa regola scatta viene contato anche come UN
+        // "incidente" di abuso @everyone (non i singoli messaggi): se lo
+        // stesso utente ripete il pattern >= everyoneAbuseLimit volte, in
+        // canali diversi, entro everyoneAbuseWindow (1 ora di default),
+        // scatta invece un timeout severo fisso (everyoneAbuseTimeoutMs).
         if (targets.has('everyone')) {
             const evResult = this.pingTracker.addEveryonePing(uid, chId);
 
             if (evResult.uniqueChannels >= 2) {
-                this.pingTracker.clearUser(uid);
+                // Registra l'incidente PRIMA di ripulire le cache normali:
+                // everyoneAbuseCache non viene mai toccato da clearUser,
+                // quindi sopravvive alle punizioni normali e può accumularsi
+                // nel tempo fino a raggiungere la soglia di abuso ripetuto.
+                const abuseResult = this.pingTracker.addEveryoneAbusePing(uid, chId);
 
+                // Pulisco solo le cache "normali" legate al ping @everyone
+                // corrente, NON lo storico degli abusi ripetuti.
+                this.pingTracker.everyoneCache.delete(uid);
+                this.pingTracker.rotationalCache.delete(uid);
+                this.pingTracker.globalCache.delete(uid);
+
+                // ── SOGLIA ABUSO RIPETUTO ─────────────────────────────────
+                if (abuseResult.totalMessages >= this.CONFIG.everyoneAbuseLimit &&
+                    abuseResult.uniqueChannels >= this.CONFIG.everyoneAbuseLimit) {
+
+                    this.pingTracker.clearEveryoneAbuse(uid);
+                    const timeoutMs = this.CONFIG.everyoneAbuseTimeoutMs;
+                    const reason = `Abuso @everyone ripetuto: ${abuseResult.totalMessages} incidenti in ${abuseResult.uniqueChannels} canali diversi entro 1 ora`;
+
+                    const [, timeoutResult] = await Promise.all([
+                        message.deletable ? message.delete().catch(() => {}) : Promise.resolve(),
+                        message.member.timeout(timeoutMs, reason)
+                            .then(() => ({ success: true }))
+                            .catch(err => {
+                                console.error(`[AntiPing Everyone Abuso] Timeout ${uid}:`, err.message);
+                                return { success: false };
+                            })
+                    ]);
+
+                    if (timeoutResult.success) {
+                        broadcastLog(guild,
+                            `🚨 @Everyone Abuso Ripetuto Multi-Canale`,
+                            `**${message.author.tag}** → Timeout **3 ore**\n` +
+                            `Incidenti: ${abuseResult.totalMessages} | Canali diversi: ${abuseResult.uniqueChannels}\n` +
+                            `Finestra: 1 ora`,
+                            '#c0392b', uid
+                        ).catch(() => {});
+                    }
+                    return true;
+                }
+
+                // ── PUNIZIONE NORMALE CON ESCALATION (2min/10min/1h) ──────
                 const [, result] = await Promise.all([
                     message.deletable ? message.delete().catch(() => {}) : Promise.resolve(),
                     this.applyTimeout(
@@ -1174,6 +1345,16 @@ function isAuditEntryProcessed(entryId) {
     return true;
 }
 
+// Claim atomico (check + mark senza await in mezzo): evita che gateway e
+// fallback processino la stessa entry due volte e generino doppi log / doppie
+// riparazioni. Ritorna true solo se questa chiamata "prende" l'entry per prima.
+function tryClaimAuditEntry(entryId) {
+    if (!entryId) return false;
+    if (isAuditEntryProcessed(entryId)) return false;
+    markAuditEntryProcessed(entryId);
+    return true;
+}
+
 function cleanupProcessedAuditEntries() {
     const now = Date.now();
     for (const [id, t] of processedAuditEntries) {
@@ -1368,7 +1549,7 @@ function getMemberNumber(userId, guild) {
 
 // ================= LOCKDOWN =================
 
-async function activateLockdown(guild, reason, duration = 5 * 60 * 1000) {
+async function activateLockdown(guild, reason) {
     if (lockdownActive) return;
     lockdownActive = true;
     raidModeActive = true;
@@ -1379,8 +1560,8 @@ async function activateLockdown(guild, reason, duration = 5 * 60 * 1000) {
         .setDescription(
             `**Motivo:** ${reason}\n\n` +
             `Tutti i canali sono stati bloccati.\n` +
-            `Il lockdown si disattiverà automaticamente tra **${Math.round(duration / 60000)} minuti**.\n` +
-            `Il founder può sbloccarlo con \`!unlock\`.`
+            `⚠️ Il lockdown **NON** si disattiva automaticamente: resterà attivo finché il founder ` +
+            `non lo rimuove manualmente con \`!unlock\`.`
         )
         .setColor('#ff0000')
         .setTimestamp();
@@ -1402,8 +1583,7 @@ async function activateLockdown(guild, reason, duration = 5 * 60 * 1000) {
         } catch (e) { console.error('[lockdown] canale', ch.id, e.message); }
     }));
 
-    console.log(`[Lockdown] ATTIVO — ${reason}`);
-    setTimeout(() => deactivateLockdown(guild, 'Auto-sblocco lockdown scaduto'), duration);
+    console.log(`[Lockdown] ATTIVO — ${reason} (nessuno sblocco automatico: serve !unlock)`);
 
     // Notifiche in background: non devono rallentare il blocco dei canali.
     (async () => {
@@ -1514,6 +1694,13 @@ async function dmOwnerFallback(guild, embed, pingUser = null) {
     }
 }
 
+function getUniqueLogChannelIds() {
+    const raw = Array.isArray(CONFIG.logChannels) ? CONFIG.logChannels : [];
+    // Dedup: evita invii multipli allo stesso canale se l'ID è presente più volte
+    // (e limita il loop a un set finito, niente ripetizioni infinite).
+    return [...new Set(raw.filter(id => id && id !== "0"))];
+}
+
 async function sendLog(guild, embed) {
     // Log su console SEMPRE, indipendentemente dai canali configurati:
     // così l'anti-nuke/anti-raid restano tracciabili anche senza canali log.
@@ -1521,7 +1708,7 @@ async function sendLog(guild, embed) {
     if (!guild) return;
 
     let sent = false;
-    const ids = Array.isArray(CONFIG.logChannels) ? CONFIG.logChannels.filter(id => id && id !== "0") : [];
+    const ids = getUniqueLogChannelIds();
 
     for (const channelId of ids) {
         try {
@@ -1544,7 +1731,7 @@ async function broadcastLog(guild, title, description, color = '#ff0000', pingUs
     if (!guild) return;
 
     let sent = false;
-    const ids = Array.isArray(CONFIG.logChannels) ? CONFIG.logChannels.filter(id => id && id !== "0") : [];
+    const ids = getUniqueLogChannelIds();
 
     for (const id of ids) {
         let ch = guild.channels.cache.get(id);
@@ -2566,6 +2753,131 @@ async function autoRepairAttempt(guild, entry) {
     }
 }
 
+// ================= AGGREGAZIONE INCIDENTI ANTI-NUKE =================
+// Raggruppa più azioni non autorizzate dello stesso esecutore (es. un nuke
+// con decine di canali/ruoli eliminati in pochi secondi) in UN SOLO
+// "incidente": un solo timeout, UN SOLO log di attivazione e UN SOLO log di
+// riepilogo riparazione — invece di un embed per ogni singola azione, che
+// altrimenti spamma il canale log e può far scattare rate limit su Discord.
+
+const NUKE_INCIDENT_REPORT_DELAY_MS = 3000; // attesa "silenzio" prima del riepilogo attivazione
+const nukeIncidents = new Map(); // key `${guildId}:${executorId}` -> incident
+
+function getOrCreateNukeIncident(guild, executor) {
+    const key = `${guild.id}:${executor.id}`;
+    let incident = nukeIncidents.get(key);
+    if (incident) return incident;
+
+    incident = {
+        key,
+        guild,
+        executorTag: executor.tag,
+        executorId: executor.id,
+        actions: [],
+        punishStatus: null,
+        reportTimer: null,
+        totalJobs: 0,
+        completedJobs: 0,
+        repairSuccess: 0,
+        repairFailed: 0,
+        reportSent: false,
+        repairSummarySent: false
+    };
+    nukeIncidents.set(key, incident);
+    return incident;
+}
+
+async function punishIncident(incident, execMember) {
+    if (incident.punishStatus) return; // già punito UNA volta per questo incidente
+    if (!execMember) {
+        incident.punishStatus = '⚠️ Membro non trovato in cache (impossibile punire).';
+        return;
+    }
+    if (execMember.communicationDisabledUntilTimestamp && execMember.communicationDisabledUntilTimestamp > Date.now()) {
+        incident.punishStatus = '✅ Già in timeout (nessuna azione ulteriore necessaria).';
+        return;
+    }
+
+    // ── FALLBACK KICK ──────────────────────────────────────────────────────
+    // Se il timeout non è applicabile (utente con permessi Administrator o
+    // ruolo comunque "immune" al timeout per regole interne di Discord/gerarchia
+    // ruoli del bot), proviamo comunque a espellerlo, se il bot ne ha il
+    // permesso/gerarchia sufficiente.
+    if (!execMember.moderatable) {
+        if (execMember.kickable) {
+            const kicked = await execMember.kick('Anti-Nuke: azioni multiple non autorizzate — timeout non applicabile, espulso come fallback')
+                .then(() => true)
+                .catch(err => {
+                    console.error('[punishIncident] Errore kick fallback:', err.message);
+                    return false;
+                });
+            incident.punishStatus = kicked
+                ? '👢 Timeout non applicabile (utente immune) → espulso dal server.'
+                : '❌ Timeout non applicabile e kick fallito.';
+        } else {
+            incident.punishStatus = '❌ Ruolo troppo alto: impossibile applicare timeout o kick.';
+        }
+        return;
+    }
+
+    await execMember.timeout(CONFIG.timeoutUnOra, 'Anti-Nuke: azioni multiple non autorizzate rilevate').catch(console.error);
+    incident.punishStatus = '✅ Timeout 1h applicato.';
+}
+
+function scheduleNukeIncidentReport(incident) {
+    if (incident.reportTimer) clearTimeout(incident.reportTimer);
+    incident.reportTimer = setTimeout(() => sendNukeIncidentReport(incident.key), NUKE_INCIDENT_REPORT_DELAY_MS);
+}
+
+function sendNukeIncidentReport(key) {
+    const incident = nukeIncidents.get(key);
+    if (!incident || incident.reportSent) return;
+    incident.reportSent = true;
+    // Libera lo slot: se l'attaccante riprende dopo il report, parte un
+    // nuovo incidente (nuovo log) invece di riaprire quello vecchio.
+    nukeIncidents.delete(key);
+
+    const counts = {};
+    for (const a of incident.actions) counts[a.reason] = (counts[a.reason] || 0) + 1;
+    const detailText = Object.entries(counts).map(([r, c]) => `${r} × ${c}`).join('\n') || 'N/A';
+
+    const embed = new EmbedBuilder()
+        .setTitle('⚠️ ANTI-NUKE ATTIVATO ⚠️')
+        .setColor(0xFF0000)
+        .addFields(
+            { name: 'Utente Punito', value: `${incident.executorTag} (\`${incident.executorId}\`)`, inline: true },
+            { name: 'Azioni Rilevate', value: `${incident.actions.length}`, inline: true },
+            { name: 'Punizione', value: incident.punishStatus || 'N/A' },
+            { name: 'Dettaglio Violazioni', value: detailText },
+            { name: '🔧 Riparazione Automatica', value: `⏳ Accodata (${incident.totalJobs} elementi). Riceverai UN riepilogo a fine riparazione.` }
+        ).setTimestamp();
+
+    sendLog(incident.guild, embed).catch(() => {});
+
+    // Se la riparazione ha già finito tutto prima di questo report, manda
+    // subito anche il riepilogo finale.
+    maybeSendRepairSummary(incident);
+}
+
+function maybeSendRepairSummary(incident) {
+    if (!incident.reportSent) return;              // aspetta prima il report di attivazione
+    if (incident.completedJobs < incident.totalJobs) return; // riparazione non ancora finita
+    if (incident.repairSummarySent) return;
+    incident.repairSummarySent = true;
+
+    const embed = new EmbedBuilder()
+        .setTitle('🔧 Riparazione Automatica — Riepilogo')
+        .setColor(incident.repairFailed > 0 ? 0xe67e22 : 0x2ecc71)
+        .setDescription(
+            `Riparazione completata per l'incidente di **${incident.executorTag}**.\n` +
+            `✅ Riusciti: **${incident.repairSuccess}**\n` +
+            (incident.repairFailed > 0 ? `❌ Falliti: **${incident.repairFailed}** (verifica manuale consigliata)` : '')
+        )
+        .setTimestamp();
+
+    sendLog(incident.guild, embed).catch(() => {});
+}
+
 // ================= CODA DI RIPARAZIONE PERSISTENTE =================
 // A differenza di una singola chiamata sincrona, questa coda (una per guild)
 // NON si ferma al primo fallimento o rate limit: ogni elemento fallito viene
@@ -2574,6 +2886,10 @@ async function autoRepairAttempt(guild, entry) {
 // in sequenza) restano tutti in coda e vengono lavorati uno dopo l'altro
 // finché il server non è completamente sistemato — anche se vengono
 // eliminati o modificati TUTTI i canali/ruoli contemporaneamente.
+//
+// I log per-singolo-elemento sono stati rimossi: i risultati vengono
+// accumulati nell'"incidente" (vedi sopra) e comunicati con UN SOLO
+// riepilogo finale, per evitare di spammare il canale log durante un nuke.
 
 const REPAIR_MAX_ATTEMPTS = 15;
 const REPAIR_BASE_DELAY_MS = 300;    // 0.3s — primo retry quasi immediato
@@ -2584,13 +2900,13 @@ const REPAIR_MAX_DELAY_MS = 8000;    // tetto massimo di attesa: 8s
 // vengono sistemati quasi tutti assieme invece che in fila indiana.
 const REPAIR_CONCURRENCY = 5;
 
-const repairQueues = new Map();   // guildId -> array di { entry, attempts }
+const repairQueues = new Map();   // guildId -> array di { entry, attempts, incident }
 const repairRunning = new Map();  // guildId -> boolean
 
-function enqueueRepair(guild, entry) {
+function enqueueRepair(guild, entry, incident = null) {
     if (!guild || !entry) return;
     if (!repairQueues.has(guild.id)) repairQueues.set(guild.id, []);
-    repairQueues.get(guild.id).push({ entry, attempts: 0 });
+    repairQueues.get(guild.id).push({ entry, attempts: 0, incident });
     runRepairQueue(guild).catch(e => console.error('[RepairQueue] Errore fatale:', e));
 }
 
@@ -2607,13 +2923,10 @@ async function repairWorker(guild, queue) {
         const result = await autoRepairAttempt(guild, job.entry);
 
         if (result.success) {
-            if (result.message) {
-                sendLog(guild, new EmbedBuilder()
-                    .setTitle('🔧 Riparazione Automatica')
-                    .setColor(0x2ecc71)
-                    .setDescription(result.message)
-                    .setTimestamp()
-                ).catch(() => {});
+            if (job.incident) {
+                job.incident.repairSuccess++;
+                job.incident.completedJobs++;
+                maybeSendRepairSummary(job.incident);
             }
             continue;
         }
@@ -2630,12 +2943,11 @@ async function repairWorker(guild, queue) {
             queue.push(job);
         } else {
             console.error(`[RepairQueue] Riparazione fallita definitivamente dopo ${REPAIR_MAX_ATTEMPTS} tentativi:`, result.message);
-            sendLog(guild, new EmbedBuilder()
-                .setTitle('⚠️ Riparazione Automatica Fallita')
-                .setColor(0xe74c3c)
-                .setDescription(`Impossibile completare la riparazione dopo **${REPAIR_MAX_ATTEMPTS} tentativi**.\n${result.message}\n\nPotrebbe servire un intervento manuale.`)
-                .setTimestamp()
-            ).catch(() => {});
+            if (job.incident) {
+                job.incident.repairFailed++;
+                job.incident.completedJobs++;
+                maybeSendRepairSummary(job.incident);
+            }
         }
     }
 }
@@ -2729,42 +3041,26 @@ async function gestisciAzione(guild, entry) {
     // ha permessi !concedi attivi — in tutti gli altri casi (sopra) la
     // funzione è già uscita con un return, quindi né la punizione né la
     // riparazione vengono mai applicate a chi ha !concedi attivo.
+    //
+    // NOVITÀ: tutte le azioni dello stesso esecutore vengono raggruppate in
+    // UN SOLO "incidente" (vedi sezione AGGREGAZIONE INCIDENTI ANTI-NUKE più
+    // sopra): un solo timeout, UN SOLO embed di attivazione (dopo qualche
+    // secondo di "silenzio" dall'attaccante) e UN SOLO riepilogo di
+    // riparazione — invece di un embed per ogni singolo canale/ruolo colpito,
+    // che con un nuke vero produceva centinaia di messaggi e rischiava
+    // rate limit / "bug" del bot.
     try {
-        const logEmbed = new EmbedBuilder()
-            .setTitle("⚠️ ANTI-NUKE ATTIVATO ⚠️")
-            .setColor(0xFF0000)
-            .addFields(
-                { name: "Utente Punito", value: `${executor.tag} (\`${executor.id}\`)`, inline: true },
-                { name: "Regola Violata", value: reason, inline: true },
-                { name: "Bersaglio", value: targetInfo }
-            ).setTimestamp();
+        const incident = getOrCreateNukeIncident(guild, executor);
+        incident.actions.push({ reason, targetInfo });
 
-        // NOTA: nessuna punizione rimuove più i ruoli — solo timeout.
-        let punishStatus = '⚠️ Membro non trovato in cache (impossibile punire).';
-        if (execMember) {
-            if (!execMember.moderatable) {
-                punishStatus = '❌ Ruolo bot troppo basso, impossibile applicare il timeout.';
-            } else {
-                await execMember.timeout(CONFIG.timeoutUnOra, `Anti-Nuke: ${reason}`).catch(console.error);
-                punishStatus = '✅ Timeout 1h applicato.';
-            }
-        }
+        await punishIncident(incident, execMember); // timeout applicato UNA sola volta per incidente
 
-        // RIPARAZIONE AUTOMATICA: viene ACCODATA (non eseguita qui in modo
-        // sincrono). La coda per-guild continua a lavorare finché non ha
-        // riparato TUTTO ciò che è stato accodato, anche se nel frattempo
-        // arrivano altre decine di eventi (es. tutti i canali del server
-        // eliminati/modificati in sequenza) — non si ferma al primo errore
-        // o rate limit, ritenta con backoff finché non riesce o esaurisce i
-        // tentativi massimi per quel singolo elemento (log a parte).
-        enqueueRepair(guild, entry);
+        incident.totalJobs++;
+        enqueueRepair(guild, entry, incident);
 
-        logEmbed.addFields(
-            { name: "Punizione", value: punishStatus },
-            { name: "🔧 Riparazione Automatica", value: "⏳ Accodata (il risultato verrà notificato a parte, non appena completata)." }
-        );
-
-        sendLog(guild, logEmbed).catch(() => {});
+        // Riprogramma il riepilogo ad ogni nuova azione: un unico embed verrà
+        // inviato solo dopo qualche secondo di "silenzio" dallo stesso utente.
+        scheduleNukeIncidentReport(incident);
     } catch (e) { console.error('[gestisciAzione]', e); }
 }
 
@@ -3061,14 +3357,16 @@ function formatAuditTargetInfo(entry) {
 // REST e zero retry. È il modo più veloce possibile per reagire a un'azione.
 // Passa l'entry COMPLETA a gestisciAzione, così in caso di violazione si può
 // anche avviare la riparazione automatica (autoRepair) usando entry.changes.
+// tryClaimAuditEntry evita doppia elaborazione se un fallback REST ha già
+// gestito la stessa entry (o viceversa).
 client.on('guildAuditLogEntryCreate', async (entry, guild) => {
     try {
         updateAuditLogHotCache(guild.id, entry);
 
         const reason = AUDIT_ACTION_REASONS.get(entry.action);
         if (!reason || !entry.executor) return;
+        if (!tryClaimAuditEntry(entry.id)) return;
 
-        markAuditEntryProcessed(entry.id);
         await gestisciAzione(guild, entry);
     } catch (e) { console.error('[guildAuditLogEntryCreate]', e); }
 });
@@ -3079,43 +3377,37 @@ client.on('guildAuditLogEntryCreate', async (entry, guild) => {
 // due volte. Passano anch'essi l'entry completa a gestisciAzione.
 client.on('channelCreate', async ch => {
     const log = await fetchAuditLogEntry(ch.guild, AuditLogEvent.ChannelCreate, ch.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(ch.guild, log);
     }
 });
 client.on('channelUpdate', async (_, nCh) => {
     const log = await fetchAuditLogEntry(nCh.guild, AuditLogEvent.ChannelUpdate, nCh.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(nCh.guild, log);
     }
 });
 client.on('channelDelete', async ch => {
     const log = await fetchAuditLogEntry(ch.guild, AuditLogEvent.ChannelDelete, ch.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(ch.guild, log);
     }
 });
 client.on('roleCreate', async role => {
     const log = await fetchAuditLogEntry(role.guild, AuditLogEvent.RoleCreate, role.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(role.guild, log);
     }
 });
 client.on('roleUpdate', async (_, nRole) => {
     const log = await fetchAuditLogEntry(nRole.guild, AuditLogEvent.RoleUpdate, nRole.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(nRole.guild, log);
     }
 });
 client.on('roleDelete', async role => {
     const log = await fetchAuditLogEntry(role.guild, AuditLogEvent.RoleDelete, role.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(role.guild, log);
     }
 });
@@ -3131,15 +3423,13 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
 client.on('guildBanAdd', async ban => {
     const log = await fetchAuditLogEntry(ban.guild, AuditLogEvent.MemberBanAdd, ban.user.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(ban.guild, log);
     }
 });
 client.on('guildMemberRemove', async member => {
     const log = await fetchAuditLogEntry(member.guild, AuditLogEvent.MemberKick, member.id);
-    if (log?.executor && !isAuditEntryProcessed(log.id)) {
-        markAuditEntryProcessed(log.id);
+    if (log?.executor && tryClaimAuditEntry(log.id)) {
         await gestisciAzione(member.guild, log);
     }
 });
@@ -3220,6 +3510,7 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('ticket_setup').setDescription('Crea (o ripara se eliminato) il pannello ticket "assistenza"')
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
         new SlashCommandBuilder().setName('comandi').setDescription('Mostra la lista completa dei comandi del bot (solo founder)'),
+        creavideoCommand.data,
 
         // ── /config: gestione runtime della configurazione sensibile ────────
         new SlashCommandBuilder().setName('config').setDescription('Gestisci la configurazione del bot (whitelist, ruoli, canali...)')
@@ -3768,6 +4059,10 @@ client.on('interactionCreate', async interaction => {
                     value: '`/ticket_setup` — crea/ripara il pannello ticket nel canale "assistenza"'
                 },
                 {
+                    name: '🎬 Creazione contenuti (tutti)',
+                    value: '`/creavideo <clip> <testo> [voce]` — genera un video con voce sintetica (Edge TTS, gratis) e sottotitoli bruciati con ffmpeg'
+                },
+                {
                     name: '🌐 Generali (tutti)',
                     value:
                         '`/verify` — verifica l\'account nel canale di verifica\n' +
@@ -3784,6 +4079,10 @@ client.on('interactionCreate', async interaction => {
             .setTimestamp();
 
         return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    if (interaction.commandName === 'creavideo') {
+        return creavideoCommand.execute(interaction);
     }
 
     if (interaction.commandName === 'restore_server') {
@@ -3832,4 +4131,25 @@ client.on('interactionCreate', async interaction => {
 // ================= ERROR HANDLING =================
 process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
 
-client.login(process.env.TOKEN || process.env.DISCORD_TOKEN);
+const LOGIN_RETRY_BASE_DELAY_MS = 5000;   // 5s
+const LOGIN_RETRY_MAX_DELAY_MS = 60000;   // tetto: 60s
+let loginAttempt = 0;
+
+async function loginWithRetry() {
+    const token = process.env.TOKEN || process.env.DISCORD_TOKEN;
+    try {
+        await client.login(token);
+        console.log('✅ Login riuscito.');
+        loginAttempt = 0;
+    } catch (err) {
+        loginAttempt++;
+        const wait = Math.min(
+            LOGIN_RETRY_BASE_DELAY_MS * Math.pow(1.5, loginAttempt - 1),
+            LOGIN_RETRY_MAX_DELAY_MS
+        );
+        console.error(`❌ Login fallito (tentativo ${loginAttempt}): ${err.message}. Riprovo tra ${Math.round(wait / 1000)}s...`);
+        setTimeout(loginWithRetry, wait);
+    }
+}
+
+loginWithRetry();
