@@ -1,115 +1,241 @@
-# Discord Anti-Nuke / Moderation Bot by Patabollente20
+# 🤖 Bot Moderazione Discord
 
-Bot Discord "tutto in uno": anti-nuke con riparazione automatica, anti-spam,
-anti-ping, anti-raid/lockdown, anti-link, server stats, sistema ticket,
-regolamento e un pannello di **configurazione runtime tramite comandi slash**
-(`/config`) — non serve più modificare il codice o riavviare il bot per
-cambiare whitelist, ruoli o canali.
+Bot Discord avanzato per moderazione automatica, sicurezza e gestione server.  
+Scritto in **Node.js** con **discord.js v14**.  
+Include anti-nuke, anti-spam, anti-ping, anti-raid, sistema ticket, statistiche, backup automatico e molto altro.
 
-## Setup rapido
+---
 
-1. Clona il repository e installa le dipendenze:
+## ✨ Funzionalità
 
+### 🛡️ Sicurezza e Moderazione Automatica
+- **Anti-Spam** – locale, rotazionale, vocale. Timeout progressivi (10 min → 1 ora → 24 ore).
+- **Anti-Ping** – testuale, vocale, rotazionale, globale, `@everyone` rapido e multi-canale.
+- **Anti-Raid** – rileva join flood, account nuovi, ondate sospette. Attiva lockdown automatico.
+- **Anti-Nuke** – monitora audit log, timeout esecutore, ripara automaticamente canali/ruoli/ban.
+- **Anti-Link** – elimina inviti Discord.
+- **Anti-Ghost-Ping** – rileva e logga chi pinga e cancella il messaggio.
+- **Lockdown** – blocca tutti i canali testuali con un comando. Solo il founder può rimuoverlo.
+- **Whitelist e ruoli immuni** – proteggi utenti fidati.
+- **Permessi temporanei** – concedi azioni di moderazione limitate nel tempo.
+
+### 📋 Gestione Membri
+- **Benvenuto personalizzato** – embed con data creazione server, account, numero membro.
+- **Verifica** – assegna ruolo membro (e OG se il server ha ≤150 membri).
+- **Regolamento** – embed formattato con sezioni e menzioni staff.
+- **Statistiche** – canali vocali con conteggi aggiornati ogni 6 minuti.
+- **Ticket** – pannello con pulsanti, apertura ticket privato, motivi con ruoli, chiusura.
+- **Backup automatico** – ogni 24 ore, 10 copie conservate. Ripristino completo con un comando.
+
+### 📝 Log
+- **Log messaggi** – eliminati e modificati.
+- **Log vocale** – entrate, uscite, cambi canale, mute/deaf.
+- **Log membri** – nickname, ruoli aggiunti/rimossi.
+- **Log moderazione** – canali/ruoli creati/eliminati, ban/kick.
+- **Log generali** – tutte le azioni di moderazione automatica.
+
+### 🎮 Comandi
+- Moderazione: `/kick`, `/ban`, `/unban`, `/timeout`, `/untimeout`, `/warn`, `/clear`, `/roleall`, `/controlla`
+- Utility: `/serverinfo`, `/userinfo`, `/avatar`, `/ping`, `/help`, `/regole`
+- Configurazione: `/config` (whitelist, ruoli, canali, log, staff, ticket)
+- Backup: `/backup_server`, `/restore_server`
+- Stats: `/stats_setup`, `/stats_refresh`
+- Ticket: `/ticket_setup`
+- Owner: `!concedi`, `!toglipermessi`, `!lock`, `!unlock`
+
+---
+
+## 🚀 Installazione
+
+### Prerequisiti
+- **Node.js** v18 o superiore
+- **npm**
+- Un bot Discord creato sul [Portale Sviluppatori](https://discord.com/developers/applications)
+
+### Passaggi
+
+1. **Clona il repository**
    ```bash
-   git clone <url-del-tuo-repo>
-   cd <cartella>
-   npm install
-   ```
+   git clone https://github.com/tuo-username/tuo-repo.git
+   cd tuo-repo
+Installa le dipendenze
 
-2. Crea un'applicazione su [Discord Developer Portal](https://discord.com/developers/applications),
-   aggiungi un Bot, copia il **Token** e il **Client ID (Application ID)**.
+bash
+npm install
+Crea il file .env nella root del progetto (copia .env.example se presente).
 
-3. Copia `.env.example` in `.env` e compila i valori:
+env
+TOKEN=il_tuo_token_discord
+CLIENT_ID=id_del_bot
+GUILD_ID=id_del_server (opzionale, per comandi locali)
+OWNER_ID=il_tuo_id_discord
+Avvia il bot
 
-   ```bash
-   cp .env.example .env
-   ```
+bash
+node index.js
+⚙️ Configurazione
+Tutte le impostazioni principali si gestiscono con il comando /config dopo l'avvio.
+Le variabili d'ambiente nel .env servono per i parametri di base.
 
-   ```env
-   TOKEN=il_tuo_token
-   CLIENT_ID=id_del_tuo_bot
-   GUILD_ID=id_del_tuo_server        # opzionale, per test istantanei
-   OWNER_ID=825397327187279942        # founder del bot
-   ```
+Variabili .env
+Variabile	Descrizione	Obbligatorio
+TOKEN	Token del bot	Sì
+CLIENT_ID	ID applicazione del bot	Sì
+GUILD_ID	ID del server (per comandi locali)	No
+OWNER_ID	ID del founder (immune)	Sì
+LOG_CHANNEL_IDS	ID canali log generali (separati da virgola)	No
+MESSAGE_LOG_CHANNEL_ID	Canale log messaggi edit/delete	No
+VOICE_LOG_CHANNEL_ID	Canale log vocale	No
+MEMBER_LOG_CHANNEL_ID	Canale log membri	No
+MOD_LOG_CHANNEL_ID	Canale log moderazione	No
+WELCOME_CHANNEL_ID	Canale benvenuto	No
+VERIFY_CHANNEL_ID	Canale verifica	No
+ALERT_CHANNEL_ID	Canale alert (lockdown, raid)	No
+SUSPICIOUS_BOT_LOG_CHANNEL_ID	Canale log bot sospetti	No
+IMMUNE_ROLE_ID	Ruolo immune	No
+MEMBER_ROLE_ID	Ruolo membro	Sì
+OG_ROLE_ID	Ruolo OG (per server piccoli)	No
+WHITELISTED_IDS	ID utenti whitelist (separati da virgola)	No
+AI_FREE_CHANNEL_IDS	Canali "free" (nessun filtro)	No
+AUTO_PUBLISH_CHANNELS	Canali announcement da pubblicare automaticamente	No
+LOG_LEVEL	Livello log (debug, info, warn, error)	No
+🧠 Come funziona l'Anti-Nuke
+Il bot monitora costantemente l'audit log del server.
+Se un utente non autorizzato esegue azioni distruttive (creazione/eliminazione canali o ruoli, ban, kick), il bot:
 
-   ⚠️ **Non committare mai `.env`** — è già escluso da `.gitignore`.
+Applica un timeout di 1 ora all'esecutore.
 
-4. Invita il bot nel tuo server con questi permessi minimi:
-   `Manage Roles`, `Manage Channels`, `Kick Members`, `Ban Members`,
-   `Moderate Members` (timeout), `Manage Messages`, `View Audit Log`,
-   `Send Messages`, `Read Message History`.
+Avvia una coda di riparazione che ricrea canali/ruoli eliminati e ripristina i ban.
 
-   Intents privilegiati da abilitare nel Developer Portal (tab "Bot"):
-   `SERVER MEMBERS INTENT` e `MESSAGE CONTENT INTENT`.
+Invia un report dettagliato nel canale log.
 
-5. Avvia il bot:
+Al termine, invia un riepilogo delle riparazioni.
 
-   ```bash
-   npm start
-   ```
+Le azioni da parte di owner, whitelist o ruoli immuni sono sempre autorizzate e loggate.
 
-Al primo avvio i comandi slash vengono registrati sia sul server indicato in
-`GUILD_ID` (istantaneo) sia globalmente (fino a 1h di propagazione).
+📦 Backup e Ripristino
+Backup automatico ogni 24 ore.
 
-## Configurazione tramite Discord — comando `/config`
+10 copie conservate in ./backups/history/.
 
-Tutti i valori "sensibili" (whitelist, ruoli, canali) **non sono più
-hardcoded** nel codice: sono salvati in `config.settings.json` (creato
-automaticamente, ignorato da git) e modificabili in qualunque momento con
-`/config`, senza riavviare il bot.
+Il comando /backup_server forza un backup manuale.
 
-| Comando | Descrizione | Permesso richiesto |
-|---|---|---|
-| `/config show` | Mostra la configurazione attuale | Administrator |
-| `/config whitelist add \| remove \| list` | Gestisce chi è immune da anti-nuke/anti-spam/anti-ping | **Solo founder** |
-| `/config role set target:<immuneRoleId\|memberRoleId\|ogRoleId> ruolo:<@ruolo>` | Imposta il ruolo immune, il ruolo membro verificato o il ruolo OG | `immuneRoleId` → **solo founder**; gli altri → Administrator |
-| `/config channel set target:<alertChannelId\|verifyChannelId\|welcomeChannelId\|suspiciousBotLogChannelId> canale:<#canale>` | Imposta i canali di sistema | Administrator |
-| `/config logchannel add \| remove \| list` | Canali dove il bot invia i log di moderazione | Administrator |
-| `/config freechannel add \| remove \| list` | Canali esclusi da anti-spam/anti-ping (es. canali con bot AI) | Administrator |
-| `/config staffrole set chiave:<helper\|moderator\|founder\|headMedia\|admin\|senior> ruolo:<@ruolo>` | Ruoli staff usati da `/regole` e dal sistema ticket | Administrator |
-| `/config ticketrole set motivo:<membri\|bot> ruolo:<@ruolo>` | Ruolo pingato dal sistema ticket per ciascun motivo | Administrator |
+Il comando /restore_server ripristina l'ultimo backup (elimina tutti i canali/ruoli attuali e li ricrea).
 
-La whitelist e il ruolo immune garantiscono un **bypass totale** delle
-protezioni anti-nuke/anti-spam/anti-ping: per questo, anche se `/config` in
-generale richiede il permesso `Administrator`, questi due sottocomandi sono
-riservati esclusivamente al founder (`OWNER_ID` nel `.env`).
+🎫 Sistema Ticket
+Pannello in un canale dedicato con pulsante "Apri Ticket".
 
-Le altre impostazioni "di comportamento" (soglie anti-spam, tempi di
-escalation dei timeout, limiti anti-raid, ecc.) restano nell'oggetto
-`CONFIG` in cima a `index.js`: sono parametri di tuning che tipicamente si
-toccano raramente e in fase di sviluppo, quindi sono rimasti nel codice per
-semplicità — puoi comunque spostarli in `SETTABLE_FIELDS` seguendo lo stesso
-schema se vuoi renderli configurabili anch'essi.
+All'apertura viene creato un canale privato con l'utente e lo staff.
 
-## Altri comandi principali
+L'utente seleziona il motivo (es. problema tra membri, problema con il bot).
 
-- `/kick`, `/ban`, `/unban`, `/timeout`, `/untimeout`, `/clear` — moderazione base
-- `/regole` — mostra il regolamento del server, personalizzabile a riga 1210
-- `/verify` — verifica un membro nel canale di verifica
-- `/backup_server`, `/restore_server` — backup/ripristino di canali e ruoli
-- `/stats_setup`, `/stats_refresh` — canali contatore "Server Stats"
-- `/ticket_setup` — pannello ticket nel canale "assistenza"
-- `/comandi` — lista comandi completa (solo founder)
-- `!lock [motivo]`, `!unlock`, `!concedi @utente <n>`, `!toglipermessi @utente <n>` — comandi founder con prefisso "!"
+Lo staff competente viene menzionato.
 
-## Struttura dei dati persistenti
+Il ticket può essere chiuso da utente o staff.
 
-Questi file vengono creati automaticamente nella cartella del bot e **non**
-vanno committati (sono già in `.gitignore`):
+📊 Statistiche
+Crea una categoria "📊 SERVER STATS" con canali vocali.
 
-- `config.settings.json` — configurazione modificata via `/config`
-- `member_numbers.json` — numero progressivo membri
-- `stats_channels.json` — riferimenti ai canali "Server Stats"
-- `ticket_data.json` — stato dei ticket aperti
-- `backups/backup_<guildId>.json` — backup per server
+Mostra: membri, bot, staff, tutti.
 
-## Deploy
+Aggiornamento automatico ogni 6 minuti.
 
-Il bot è un semplice processo Node.js long-running (`node index.js`), quindi
-funziona su qualsiasi host che supporti processi persistenti (VPS, Railway,
-Render, un container Docker, ecc.) — **non** funziona su piattaforme
-serverless "a richiesta" che spengono il processo tra un evento e l'altro.
-Assicurati di impostare le variabili d'ambiente del `.env` anche nella
-piattaforma di hosting scelta, e monta un volume persistente se vuoi
-conservare `config.settings.json` e gli altri file dati tra un deploy e
-l'altro.
+Comandi: /stats_setup (crea/ripara), /stats_refresh (forza aggiornamento).
+
+🛠️ Comandi principale
+Moderazione
+/kick @utente [motivo] – espelle
+
+/ban @utente [motivo] – banna
+
+/unban <id> [motivo] – rimuove ban
+
+/timeout @utente <minuti> [motivo] – timeout
+
+/untimeout @utente [motivo] – rimuove timeout
+
+/warn @utente <motivo> – avviso con DM
+
+/clear <quantità> – elimina fino a 1000 messaggi
+
+/roleall <ruolo> – assegna ruolo a tutti
+
+/controlla <utente> – cerca richieste whitelist
+
+Utility
+/serverinfo – info server
+
+/userinfo [@utente] – info utente
+
+/avatar [@utente] – avatar
+
+/ping – latenza
+
+/help – lista comandi
+
+/regole – regolamento
+
+/verify – verifica
+
+Configurazione
+/config show
+
+/config whitelist add|remove|list
+
+/config role set <target> <ruolo>
+
+/config channel set <target> <canale>
+
+/config logchannel add|remove|list
+
+/config freechannel add|remove|list
+
+/config publishchannel add|remove|list
+
+/config staffrole set <chiave> <ruolo>
+
+/config ticketrole set <motivo> <ruolo>
+
+Solo Founder
+!concedi @utente <n> – permessi temporanei
+
+!toglipermessi @utente <n> – rimuove permessi
+
+!lock [motivo] – lockdown
+
+!unlock – rimuove lockdown
+
+Backup e Stats
+/backup_server
+
+/restore_server
+
+/stats_setup
+
+/stats_refresh
+
+/ticket_setup
+
+🔒 Permessi
+Owner e whitelist sono immuni da qualsiasi azione automatica.
+
+I ruoli immuni sono configurabili.
+
+I comandi di moderazione richiedono i permessi Discord adeguati.
+
+I comandi di configurazione richiedono Administrator.
+
+Alcuni comandi sono riservati al founder.
+
+📄 Licenza
+Questo progetto è distribuito sotto licenza MIT.
+Vedi il file LICENSE per i dettagli.
+
+🤝 Contribuire
+I contributi sono benvenuti!
+Apri una issue o una pull request per migliorare il bot.
+
+📞 Contatti
+Per domande o supporto, apri una issue su GitHub.
+
+Buon divertimento! 🎉
