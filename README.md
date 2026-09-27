@@ -1,4 +1,4 @@
-# 🤖 Bot Moderazione Discord
+# 🤖 TheLegkiTA-Antinuke
 
 Bot Discord avanzato per moderazione automatica, sicurezza e gestione server.  
 Scritto in **Node.js** con **discord.js v14**.  
@@ -56,8 +56,8 @@ Include anti-nuke, anti-spam, anti-ping, anti-raid, sistema ticket, statistiche,
 
 1. **Clona il repository**
    ```bash
-   git clone https://github.com/tuo-username/tuo-repo.git
-   cd tuo-repo
+   git clone https://github.com/Patatabollente20/TheLegkiTA-Antinuke.git
+   cd TheLegkiTA-Antinuke
 Installa le dipendenze
 
 bash
@@ -239,3 +239,5 @@ Apri una issue o una pull request per migliorare il bot.
 Per domande o supporto, apri una issue su GitHub.
 
 Buon divertimento! 🎉
+
+ricordati di sostituire i placeholder nel `.env` con i tuoi dati reali quando avvii il bot. per il resto, è pronto da pubblicare.
